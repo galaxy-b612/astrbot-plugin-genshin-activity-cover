@@ -1,0 +1,37 @@
+{
+  "enabled": {
+    "description": "启用插件",
+    "type": "bool",
+    "default": true
+  },
+  "check_interval": {
+    "description": "检查间隔（秒）",
+    "type": "int",
+    "default": 300
+  },
+  "target_groups": {
+    "description": "目标群聊白名单（群号列表）",
+    "type": "list",
+    "default": [
+      923312410,
+      29459043
+    ]
+  },
+  "filter_keywords": {
+    "description": "过滤关键词（包含这些词的文章将被跳过）",
+    "type": "list",
+    "default": [
+      "千星奇域"
+    ]
+  },
+  "forward_threshold_images": {
+    "description": "单篇文章图片数 >= 此值时触发合并转发",
+    "type": "int",
+    "default": 4
+  },
+  "forward_threshold_articles": {
+    "description": "批次新文章数 >= 此值时触发合并转发",
+    "type": "int",
+    "default": 2
+  }
+}

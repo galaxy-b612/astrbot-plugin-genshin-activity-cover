@@ -1,0 +1,13 @@
+{
+  "enabled": true,
+  "check_interval": 300,
+  "target_groups": [
+    923312410,
+    29459043
+  ],
+  "filter_keywords": [
+    "千星奇域"
+  ],
+  "forward_threshold_images": 4,
+  "forward_threshold_articles": 2
+}
