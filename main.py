@@ -43,7 +43,7 @@ class GenshinActivityCoverPlugin(Star):
 
     def _target_groups(self) -> List[int]:
         """获取目标群号列表，WebUI 存入的是字符串列表，这里统一转为 int"""
-        groups = self._cfg("target_groups", [108516.5.1])
+        groups = self._cfg("target_groups", [1085169520])
         if isinstance(groups, str):
             groups = [groups]
         return [int(g) for g in groups]
