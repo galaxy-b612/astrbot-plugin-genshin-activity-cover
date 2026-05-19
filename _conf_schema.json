@@ -5,33 +5,43 @@
     "default": true
   },
   "check_interval": {
-    "description": "检查间隔（秒）",
+    "description": "轮询间隔（秒）",
     "type": "int",
     "default": 300
+  },
+  "startup_delay": {
+    "description": "启动后首次轮询延迟（秒）",
+    "type": "int",
+    "default": 30
+  },
+  "platform_wait_timeout": {
+    "description": "等待平台就绪最大秒数",
+    "type": "int",
+    "default": 120
   },
   "target_groups": {
     "description": "目标群聊白名单（群号列表）",
     "type": "list",
-    "default": [
-      923312410,
-      29459043
-    ]
+    "default": [1085169520]
   },
   "filter_keywords": {
-    "description": "过滤关键词（包含这些词的文章将被跳过）",
+    "description": "过滤关键词（标题包含则跳过）",
     "type": "list",
-    "default": [
-      "千星奇域"
-    ]
+    "default": ["千星奇域"]
   },
   "forward_threshold_images": {
-    "description": "单篇文章图片数 >= 此值时触发合并转发",
+    "description": "单篇图片数达标时触发合并转发",
     "type": "int",
     "default": 4
   },
   "forward_threshold_articles": {
-    "description": "批次新文章数 >= 此值时触发合并转发",
+    "description": "批次文章数达标时触发合并转发",
     "type": "int",
     "default": 2
+  },
+  "user_agent": {
+    "description": "自定义 User-Agent（留空使用默认）",
+    "type": "text",
+    "default": ""
   }
 }
