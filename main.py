@@ -13,24 +13,17 @@ PLUGIN_NAME = "astrbot_plugin_genshin_activity_cover"
 
 # ── 米游社 API 常量 ──────────────────────────────────────
 # gids=2: 原神社区；news_type 1=官方资讯, 3=装扮皮肤
-_GAME_ID  = 2
+_GAME_ID   = 2
 _NEWS_TYPES = [1, 3]
-_PAGE_SIZE = 5
+_PAGE_SIZE  = 5
 _API_TIMEOUT = aiohttp.ClientTimeout(total=30)
-_HTTP_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Referer": "https://www.miyoushe.com/",
-}
 
 
 @register(
     name=PLUGIN_NAME,
     desc="实时搬运原神官网官方资讯和装扮图片",
     author="iris",
-    version="6.8.0"
+    version="6.9.0"
 )
 class GenshinActivityCoverPlugin(Star):
 
@@ -57,19 +50,30 @@ class GenshinActivityCoverPlugin(Star):
         return default if val is None else val
 
     def _target_groups(self) -> list[int]:
-        """返回去重后的目标群号列表"""
         groups = self._cfg("target_groups", [1085169520])
         if isinstance(groups, str):
             groups = [groups]
-        # set 去重防止重复群号导致二次发送
         return sorted({int(g) for g in groups})
+
+    def _build_headers(self) -> dict[str, str]:
+        """构建请求头，User-Agent 可从配置覆写"""
+        ua = self._cfg("user_agent", "")
+        return {
+            "User-Agent": ua or (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Referer": "https://www.miyoushe.com/",
+        }
 
     # ── 生命周期 ──────────────────────────────────────────
 
     async def initialize(self):
         self._data_dir.mkdir(parents=True, exist_ok=True)
         self._load_posted_ids()
-        self._session = aiohttp.ClientSession()
+        # Session 仅在异步生命周期内创建，避免事件循环绑定错误
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
 
         if self._cfg("enabled", True):
             self._task = asyncio.create_task(self._delayed_start())
@@ -106,7 +110,6 @@ class GenshinActivityCoverPlugin(Star):
             await self._poll_activity_covers()
 
     def _resolve_forward_uin(self, platform) -> None:
-        """从平台实例获取机器人 QQ 号，失败设为 None 而非 '0'"""
         try:
             self._forward_sender_uin = str(platform.bot.self_id)
             logger.info(f"[原神资讯] Bot QQ号: {self._forward_sender_uin}")
@@ -124,13 +127,6 @@ class GenshinActivityCoverPlugin(Star):
         self._save_posted_ids()
         if self._session:
             await self._session.close()
-
-    # ── HTTP Session 复用 ─────────────────────────────────
-
-    def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None:
-            self._session = aiohttp.ClientSession()
-        return self._session
 
     # ── 去重持久化 ────────────────────────────────────────
 
@@ -196,10 +192,9 @@ class GenshinActivityCoverPlugin(Star):
             except Exception as e:
                 logger.error(f"[原神资讯] 检查 type={nt} 失败: {e}")
 
-    # ── 核心业务：单次 type 处理 ──────────────────────────
+    # ── 核心业务 ──────────────────────────────────────────
 
     async def _process_news_type(self, news_type: int):
-        """拉取 → 解析 → 分发 一次 news_type 的资讯"""
         articles = await self._fetch_articles(news_type)
         if not articles:
             return
@@ -215,60 +210,61 @@ class GenshinActivityCoverPlugin(Star):
             self._save_posted_ids()
             return
 
-        await self._dispatch_pending(pending)
+        art_cnt = len(pending)
+        fwd_img = self._cfg("forward_threshold_images", 4)
+        fwd_art = self._cfg("forward_threshold_articles", 2)
+        use_forward = (art_cnt >= fwd_art) or (art_cnt == 1 and len(pending[0]["images"]) >= fwd_img)
+
+        await self._send_per_platform(pending, use_forward)
+
+        for a in pending:
+            self.posted_ids.add(a["post_id"])
+        self._dirty = True
+        self._save_posted_ids()
 
     async def _fetch_articles(self, news_type: int) -> list[dict] | None:
-        """请求米游社 API，返回文章列表"""
         params = {"gids": _GAME_ID, "type": news_type, "page_size": _PAGE_SIZE}
         try:
-            sess = self._get_session()
+            sess = self._session
+            if sess is None:
+                return None
             async with sess.get(
-                self.api_url, params=params, headers=_HTTP_HEADERS,
+                self.api_url, params=params, headers=self._build_headers(),
                 timeout=_API_TIMEOUT,
             ) as resp:
                 if resp.status != 200:
                     logger.error(f"[原神资讯] API HTTP {resp.status} (type={news_type})")
                     return None
                 data = await resp.json()
-
             if "data" not in data or "list" not in data["data"]:
                 return None
-
             return data["data"]["list"]
         except aiohttp.ClientError as e:
             logger.error(f"[原神资讯] 拉取 type={news_type} 网络异常: {e}")
             return None
 
     def _parse_one_article(self, article: dict) -> dict | None:
-        """解析单篇文章：去重 → 过滤 → 提取图片 → 返回 {post_id, title, images} 或 None"""
         post = article.get("post", {})
         pid = post.get("post_id")
         title = post.get("subject", "未知资讯")
-
         if not pid:
             return None
         pid_str = str(pid)
         if pid_str in self.posted_ids:
             return None
-
         logger.info(f"[原神资讯] 发现新资讯: {pid_str} - {title[:40]}")
-
         if self._should_filter(title):
             self.posted_ids.add(pid_str)
             self._dirty = True
             return None
-
         images: set[str] = self._extract_images(post, title)
         if not images:
             return None
-
         return {"post_id": pid_str, "title": title, "images": list(images)}
 
     def _extract_images(self, post: dict, title: str) -> set[str]:
-        """根据标题是否含'活动'决定提取封面还是全部图片"""
         cover = post.get("cover")
         images: set[str] = set()
-
         if "活动" in title:
             if cover:
                 images.add(cover)
@@ -278,128 +274,63 @@ class GenshinActivityCoverPlugin(Star):
             for u in post.get("images", []) or []:
                 if u:
                     images.add(u)
-
         return images
 
-    async def _dispatch_pending(self, pending: list[dict]):
-        """根据文章数量和图片数量选择发送策略"""
-        art_cnt = len(pending)
-        fwd_img = self._cfg("forward_threshold_images", 4)
-        fwd_art = self._cfg("forward_threshold_articles", 2)
+    # ── 分平台发送（核心修复：每平台独立降级）────────────
 
-        if art_cnt >= fwd_art:
-            logger.info(f"[原神资讯] 批次有 {art_cnt} 篇新文章，使用合并转发")
-            if not await self._send_batch_forward(pending):
-                logger.warning("[原神资讯] 批次合并转发失败，回退到逐条发送")
-                for a in pending:
-                    await self._send_images_batch(a["images"], a["title"])
-        elif len(pending[0]["images"]) >= fwd_img:
-            a = pending[0]
-            logger.info(f"[原神资讯] 单篇 {len(a['images'])} 张图，使用合并转发")
-            if not await self._send_forward_message(a["title"], a["images"]):
-                logger.warning("[原神资讯] 单篇合并转发失败，回退到批量发送")
-                await self._send_images_batch(a["images"], a["title"])
-        else:
-            a = pending[0]
-            logger.info(f"[原神资讯] 单篇 {len(a['images'])} 张图，批量发送")
-            await self._send_images_batch(a["images"], a["title"])
-
-        for a in pending:
-            self.posted_ids.add(a["post_id"])
-        self._dirty = True
-        self._save_posted_ids()
-
-    # ── DRY: 统一 Bot / 群组遍历 ──────────────────────────
-
-    def _iter_bots_and_groups(self) -> list[tuple]:
-        result: list[tuple] = []
+    async def _send_per_platform(self, pending: list[dict], use_forward: bool):
+        """遍历每个平台/群组，独立决定发送方式，非 OneBot 自动降级为批量发送"""
         pm = self.context.platform_manager
         if not pm:
-            return result
-        platforms = pm.get_insts()
-        if not platforms:
-            return result
-        for p in platforms:
+            return
+        for p in pm.get_insts():
             if not hasattr(p, "bot") or not p.bot:
                 continue
+            bot = p.bot
             for gid in self._target_groups():
-                result.append((p.bot, gid))
-        return result
+                if use_forward and self._is_onebot_like(bot):
+                    ok = await self._try_forward_to_group(bot, gid, pending)
+                    if not ok:
+                        # 该平台合并转发失败 → 降级为批量发送
+                        logger.warning(f"[原神资讯] 群 {gid} 合并转发失败，降级批量发送")
+                        await self._do_batch_to_group(bot, gid, pending)
+                else:
+                    # 非 OneBot 或不足阈值 → 直接批量发送
+                    await self._do_batch_to_group(bot, gid, pending)
 
-    def _is_onebot_like(self, bot) -> bool:
-        return hasattr(bot, "call_action")
+    async def _do_batch_to_group(self, bot, gid: int, pending: list[dict]):
+        """向指定群发送批量图文消息（每条资讯一条消息）"""
+        for a in pending:
+            await self._send_images_batch_to(bot, gid, a["images"], a["title"])
 
-    @property
-    def _sender_uin(self) -> str:
-        """安全的发送者 UIN，获取失败返回空字符串"""
-        return self._forward_sender_uin or ""
-
-    # ── 发送方法 ──────────────────────────────────────────
-
-    async def _send_images_batch(self, image_list: list[str], title: str) -> bool:
-        sent_any = False
-        message = [{"type": "text", "data": {"text": f"\U0001F4E2 {title}"}}]
+    async def _send_images_batch_to(self, bot, gid: int, image_list: list[str], title: str):
+        msg = [{"type": "text", "data": {"text": f"\U0001F4E2 {title}"}}]
         for u in image_list:
-            message.append({"type": "image", "data": {"file": u}})
+            msg.append({"type": "image", "data": {"file": u}})
+        try:
+            await bot.send_group_msg(group_id=gid, message=msg)
+            logger.info(f"[原神资讯] 已批量发送 {len(image_list)} 张图片到群 {gid}: {title[:40]}")
+        except Exception as e:
+            logger.error(f"[原神资讯] 批量发送到群 {gid} 失败: {e}\n{traceback.format_exc()}")
 
-        for bot, gid in self._iter_bots_and_groups():
-            try:
-                await bot.send_group_msg(group_id=gid, message=message)
-                logger.info(f"[原神资讯] 已批量发送 {len(image_list)} 张图片到群 {gid}: {title[:40]}")
-                sent_any = True
-            except Exception as e:
-                logger.error(f"[原神资讯] 批量发送到群 {gid} 失败: {e}\n{traceback.format_exc()}")
-        return sent_any
-
-    async def _send_forward_message(self, title: str, image_list: list[str]) -> bool:
-        return await self._do_send_forward(
-            title=title,
-            build_nodes=lambda: self._build_single_article_nodes(title, image_list),
-            log_label=f"{title[:40]} ({len(image_list)}张图片)",
-        )
-
-    async def _send_batch_forward(self, pending: list[dict]) -> bool:
-        return await self._do_send_forward(
-            title="批次",
-            build_nodes=lambda: self._build_batch_nodes(pending),
-            log_label=f"{len(pending)}篇文章",
-        )
-
-    async def _do_send_forward(self, title: str, build_nodes, log_label: str) -> bool:
-        """统一的合并转发发送逻辑"""
-        sent_any = False
+    async def _try_forward_to_group(self, bot, gid: int, pending: list[dict]) -> bool:
+        """尝试合并转发到指定群，成功返回 True"""
         sn = self._forward_sender_name
         su = self._sender_uin
+        try:
+            nodes = self._build_forward_nodes(pending)
+            payload = {"group_id": gid, "messages": []}
+            for nd in nodes:
+                payload["messages"].append(await nd.to_dict())
 
-        for bot, gid in self._iter_bots_and_groups():
-            if not self._is_onebot_like(bot):
-                logger.info(f"[原神资讯] 群 {gid} 非 OneBot 平台，跳过合并转发")
-                continue
-            try:
-                nodes = build_nodes()
-                payload = {"group_id": gid, "messages": []}
-                for nd in nodes:
-                    payload["messages"].append(await nd.to_dict())
+            await bot.call_action("send_group_forward_msg", **payload)
+            logger.info(f"[原神资讯] 已发送合并转发到群 {gid} ({len(pending)}篇)")
+            return True
+        except Exception as e:
+            logger.error(f"[原神资讯] 发送合并转发到群 {gid} 失败: {e}\n{traceback.format_exc()}")
+            return False
 
-                await bot.call_action("send_group_forward_msg", **payload)
-                logger.info(f"[原神资讯] 已发送合并转发到群 {gid}: {log_label}")
-                sent_any = True
-            except Exception as e:
-                logger.error(f"[原神资讯] 发送合并转发到群 {gid} 失败: {e}\n{traceback.format_exc()}")
-        return sent_any
-
-    def _build_single_article_nodes(self, title: str, image_list: list[str]) -> list[Node]:
-        sn = self._forward_sender_name
-        su = self._sender_uin
-        nodes = [Node(content=[Plain(text=f"\U0001F4E2 {title}")], name=sn, uin=su)]
-        for i, u in enumerate(image_list, 1):
-            nodes.append(Node(
-                content=[Image(file=u), Plain(text=f"({i}/{len(image_list)})")],
-                name=sn, uin=su,
-            ))
-        return nodes
-
-    def _build_batch_nodes(self, pending: list[dict]) -> list[Node]:
+    def _build_forward_nodes(self, pending: list[dict]) -> list[Node]:
         sn = self._forward_sender_name
         su = self._sender_uin
         nodes: list[Node] = []
@@ -409,3 +340,10 @@ class GenshinActivityCoverPlugin(Star):
                 content.append(Image(file=u))
             nodes.append(Node(content=content, name=sn, uin=su))
         return nodes
+
+    def _is_onebot_like(self, bot) -> bool:
+        return hasattr(bot, "call_action")
+
+    @property
+    def _sender_uin(self) -> str:
+        return self._forward_sender_uin or ""
