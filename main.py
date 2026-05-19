@@ -1,6 +1,5 @@
 import asyncio
 import json
-import os
 import traceback
 from pathlib import Path
 
@@ -17,7 +16,7 @@ PLUGIN_NAME = "astrbot_plugin_genshin_activity_cover"
     name=PLUGIN_NAME,
     desc="实时搬运原神官网官方资讯和装扮图片",
     author="iris",
-    version="6.6.0"
+    version="6.7.0"
 )
 class GenshinActivityCoverPlugin(Star):
 
@@ -26,7 +25,6 @@ class GenshinActivityCoverPlugin(Star):
         self.config = config if config is not None else {}
         self.posted_ids: set[str] = set()
 
-        # 使用框架规范的持久化路径
         self._data_dir: Path = StarTools.get_data_dir(PLUGIN_NAME)
         self._posted_ids_file: Path = self._data_dir / "posted_ids.json"
 
@@ -34,7 +32,9 @@ class GenshinActivityCoverPlugin(Star):
         self.gids = 2
         self.news_types = [1, 3]
         self._task: asyncio.Task | None = None
-        self._platform_ready = False
+        self._session: aiohttp.ClientSession | None = None
+        self._dirty = False
+        self._shutdown = False
         self._forward_sender_name = "米游社搬运工"
         self._forward_sender_uin: str | None = None
 
@@ -55,29 +55,29 @@ class GenshinActivityCoverPlugin(Star):
     async def initialize(self):
         self._data_dir.mkdir(parents=True, exist_ok=True)
         self._load_posted_ids()
+        self._session = aiohttp.ClientSession()
 
         if self._cfg("enabled", True):
             self._task = asyncio.create_task(self._delayed_start())
-            logger.info(f"[原神资讯] 插件已初始化，等待平台连接...")
+            logger.info("[原神资讯] 插件已初始化，等待平台连接...")
             logger.info(f"[原神资讯] 已记录 {len(self.posted_ids)} 条已发送资讯")
 
     async def _delayed_start(self):
         max_wait = 120
         waited = 0
-        while waited < max_wait:
+        while waited < max_wait and not self._shutdown:
             try:
                 pm = self.context.platform_manager
                 if pm:
                     for p in pm.get_insts():
                         if hasattr(p, "bot") and p.bot:
-                            self._platform_ready = True
                             try:
                                 self._forward_sender_uin = str(p.bot.self_id)
                                 logger.info(f"[原神资讯] Bot QQ号: {self._forward_sender_uin}")
                             except Exception:
                                 self._forward_sender_uin = "0"
 
-                            logger.info(f"[原神资讯] 平台连接就绪，开始轮询...")
+                            logger.info("[原神资讯] 平台连接就绪，开始轮询...")
                             logger.info(f"[原神资讯] 目标群聊: {self._target_groups()}")
                             await self._poll_activity_covers()
                             return
@@ -85,16 +85,19 @@ class GenshinActivityCoverPlugin(Star):
                 waited += 1
                 if waited % 10 == 0:
                     logger.debug(f"[原神资讯] 等待平台连接... ({waited}s)")
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.debug(f"[原神资讯] 检查平台状态时出错: {e}")
                 await asyncio.sleep(1)
                 waited += 1
 
-        logger.warning("[原神资讯] 等待超时，尝试直接启动...")
-        self._platform_ready = True
-        await self._poll_activity_covers()
+        if not self._shutdown:
+            logger.warning("[原神资讯] 等待超时，尝试直接启动...")
+            await self._poll_activity_covers()
 
     async def terminate(self):
+        self._shutdown = True
         if self._task:
             self._task.cancel()
             try:
@@ -102,6 +105,16 @@ class GenshinActivityCoverPlugin(Star):
             except asyncio.CancelledError:
                 pass
         self._save_posted_ids()
+        if self._session:
+            await self._session.close()
+
+    # ── HTTP Session 复用 ─────────────────────────────────
+
+    def _get_session(self) -> aiohttp.ClientSession:
+        """获取复用的 Session，防止 terminate 后意外访问 None"""
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
+        return self._session
 
     # ── 去重持久化 ────────────────────────────────────────
 
@@ -117,11 +130,14 @@ class GenshinActivityCoverPlugin(Star):
             logger.info("[原神资讯] 记录文件不存在，将创建新文件")
 
     def _save_posted_ids(self):
+        if not self._dirty:
+            return
         try:
             self._posted_ids_file.write_text(
                 json.dumps({"ids": list(self.posted_ids)}, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            self._dirty = False
         except Exception as e:
             logger.error(f"[原神资讯] 保存已发布ID失败: {e}")
 
@@ -147,7 +163,7 @@ class GenshinActivityCoverPlugin(Star):
 
     async def _poll_activity_covers(self):
         await asyncio.sleep(30)
-        while True:
+        while not self._shutdown:
             try:
                 await self._check_all_types()
             except asyncio.CancelledError:
@@ -170,22 +186,20 @@ class GenshinActivityCoverPlugin(Star):
             "Referer": "https://www.miyoushe.com/",
         }
         try:
-            async with aiohttp.ClientSession() as sess:
-                async with sess.get(
-                    self.api_url, params=params, headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=30),
-                ) as resp:
-                    if resp.status != 200:
-                        logger.error(f"[原神资讯] API请求失败(type={news_type}): HTTP {resp.status}")
-                        return
-                    data = await resp.json()
+            sess = self._get_session()
+            async with sess.get(
+                self.api_url, params=params, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status != 200:
+                    logger.error(f"[原神资讯] API请求失败(type={news_type}): HTTP {resp.status}")
+                    return
+                data = await resp.json()
 
             if "data" not in data or "list" not in data["data"]:
-                logger.debug(f"[原神资讯] type={news_type} 返回数据为空")
                 return
 
             articles = data["data"]["list"]
-            logger.debug(f"[原神资讯] type={news_type} 获取到 {len(articles)} 条资讯")
 
             pending: list[dict] = []
             for article in articles:
@@ -203,7 +217,7 @@ class GenshinActivityCoverPlugin(Star):
 
                 if self._should_filter(title):
                     self.posted_ids.add(pid_str)
-                    self._save_posted_ids()
+                    self._dirty = True
                     continue
 
                 images: set[str] = set()
@@ -225,6 +239,7 @@ class GenshinActivityCoverPlugin(Star):
                     pending.append({"post_id": pid_str, "title": title, "images": img_list})
 
             if not pending:
+                self._save_posted_ids()
                 return
 
             art_cnt = len(pending)
@@ -250,8 +265,8 @@ class GenshinActivityCoverPlugin(Star):
 
             for a in pending:
                 self.posted_ids.add(a["post_id"])
+            self._dirty = True
             self._save_posted_ids()
-            logger.info(f"[原神资讯] 已记录发送 {len(pending)} 条资讯")
 
         except asyncio.TimeoutError:
             logger.error(f"[原神资讯] API请求超时(type={news_type})")
@@ -261,7 +276,6 @@ class GenshinActivityCoverPlugin(Star):
     # ── DRY: 统一 Bot / 群组遍历 ──────────────────────────
 
     def _iter_bots_and_groups(self) -> list[tuple]:
-        """遍历所有可用 bot 和目标群组，返回 [(bot, group_id), ...]"""
         result: list[tuple] = []
         pm = self.context.platform_manager
         if not pm:
@@ -277,7 +291,6 @@ class GenshinActivityCoverPlugin(Star):
         return result
 
     def _is_onebot_like(self, bot) -> bool:
-        """判断 bot 是否为 OneBot 生态实例（支持合并转发 API）"""
         return hasattr(bot, "call_action")
 
     # ── 发送方法 ──────────────────────────────────────────
