@@ -14,24 +14,17 @@ from astrbot.core import logger
     name="astrbot_plugin_genshin_activity_cover",
     desc="实时搬运原神官网官方资讯和装扮图片",
     author="iris",
-    version="6.4.0"
+    version="6.5.1"
 )
 class GenshinActivityCoverPlugin(Star):
-    def __init__(self, context):
+    def __init__(self, context, config=None):
         super().__init__(context)
         self.plugin_dir = os.path.dirname(os.path.abspath(__file__))
         self.data_dir = os.path.join(self.plugin_dir, "data")
         self.posted_ids_file = os.path.join(self.data_dir, "posted_ids.json")
-        self.config_file = os.path.join(self.data_dir, "config.json")
-        # 默认配置
-        self.config = {
-            "check_interval": 300,
-            "target_groups": [1085169520],
-            "enabled": True,
-            "filter_keywords": ["千星奇域"],
-            "forward_threshold_images": 4,  # 单篇文章图片数 >= 此值时合并转发
-            "forward_threshold_articles": 2 # 批次文章数 >= 此值时合并转发
-        }
+        # 使用框架传入的 AstrBotConfig（已包含 schema 默认值），
+        # WebUI 修改会直接写入该 config 指向的配置文件。
+        self.config = config if config is not None else {}
         self.posted_ids = set()
         self.api_url = "https://api-takumi.mihoyo.com/post/wapi/getNewsList"
         self.gids = 2
@@ -39,14 +32,27 @@ class GenshinActivityCoverPlugin(Star):
         self._task = None
         self._platform_ready = False
         self._forward_sender_name = "米游社搬运工"
-        self._forward_sender_uin = None  # 运行时获取 bot QQ 号
+        self._forward_sender_uin = None
+
+    def _cfg(self, key, default):
+        """兼容读取配置，同时支持 AstrBotConfig 和普通 dict"""
+        val = self.config.get(key, default)
+        if val is None:
+            return default
+        return val
+
+    def _target_groups(self) -> List[int]:
+        """获取目标群号列表，WebUI 存入的是字符串列表，这里统一转为 int"""
+        groups = self._cfg("target_groups", [108516.5.1])
+        if isinstance(groups, str):
+            groups = [groups]
+        return [int(g) for g in groups]
 
     async def initialize(self):
         os.makedirs(self.data_dir, exist_ok=True)
-        self._load_config()
         self._load_posted_ids()
         
-        if self.config.get("enabled", True):
+        if self._cfg("enabled", True):
             self._task = asyncio.create_task(self._delayed_start())
             logger.info(f"[原神资讯] 插件已初始化，等待平台连接...")
             logger.info(f"[原神资讯] 已记录 {len(self.posted_ids)} 条已发送资讯")
@@ -63,7 +69,6 @@ class GenshinActivityCoverPlugin(Star):
                     for platform in platforms:
                         if hasattr(platform, 'bot') and platform.bot:
                             self._platform_ready = True
-                            # 获取 bot 自身的 QQ 号
                             try:
                                 self._forward_sender_uin = str(platform.bot.self_id)
                                 logger.info(f"[原神资讯] Bot QQ号: {self._forward_sender_uin}")
@@ -72,7 +77,7 @@ class GenshinActivityCoverPlugin(Star):
                                 logger.warning(f"[原神资讯] 无法获取 Bot QQ号，使用默认值 0")
                             
                             logger.info(f"[原神资讯] 平台连接就绪，开始轮询...")
-                            logger.info(f"[原神资讯] 目标群聊: {self.config.get('target_groups', [])}")
+                            logger.info(f"[原神资讯] 目标群聊: {self._target_groups()}")
                             await self._poll_activity_covers()
                             return
                 
@@ -96,18 +101,6 @@ class GenshinActivityCoverPlugin(Star):
             self._task.cancel()
         self._save_posted_ids()
 
-    def _load_config(self):
-        if os.path.exists(self.config_file):
-            try:
-                with open(self.config_file, "r", encoding="utf-8") as f:
-                    loaded_config = json.load(f)
-                    self.config.update(loaded_config)
-                    logger.info(f"[原神资讯] 配置已加载: {self.config}")
-            except Exception as e:
-                logger.error(f"[原神资讯] 加载配置失败: {e}")
-        else:
-            logger.warning(f"[原神资讯] 配置文件不存在，使用默认配置")
-
     def _load_posted_ids(self):
         if os.path.exists(self.posted_ids_file):
             try:
@@ -119,7 +112,7 @@ class GenshinActivityCoverPlugin(Star):
                 logger.error(f"[原神资讯] 加载已发布ID失败: {e}")
                 self.posted_ids = set()
         else:
-            logger.warning(f"[原神资讯] 记录文件不存在，将创建新文件")
+            logger.info(f"[原神资讯] 记录文件不存在，将创建新文件")
             self.posted_ids = set()
 
     def _save_posted_ids(self):
@@ -131,7 +124,7 @@ class GenshinActivityCoverPlugin(Star):
             logger.error(f"[原神资讯] 保存已发布ID失败: {e}")
 
     def _should_filter(self, title: str) -> bool:
-        """检查标题是否需要过滤：七圣召唤、带'装扮'两个字"""
+        """检查标题是否需要过滤：七圣召唤、装扮、自定义关键词"""
         if "七圣召唤" in title:
             logger.info(f"[原神资讯] 过滤内容（包含'七圣召唤'）: {title}")
             return True
@@ -140,9 +133,9 @@ class GenshinActivityCoverPlugin(Star):
             logger.info(f"[原神资讯] 过滤内容（包含'装扮'）: {title}")
             return True
         
-        filter_keywords = self.config.get("filter_keywords", ["千星奇域"])
+        filter_keywords = self._cfg("filter_keywords", ["千星奇域"])
         for keyword in filter_keywords:
-            if keyword in title:
+            if keyword and keyword in title:
                 logger.info(f"[原神资讯] 过滤内容（包含'{keyword}'）: {title}")
                 return True
         
@@ -161,7 +154,7 @@ class GenshinActivityCoverPlugin(Star):
             except Exception as e:
                 logger.error(f"[原神资讯] 轮询失败: {e}")
             
-            await asyncio.sleep(self.config.get("check_interval", 300))
+            await asyncio.sleep(self._cfg("check_interval", 300))
 
     async def _check_all_types(self):
         for news_type in self.news_types:
@@ -180,8 +173,6 @@ class GenshinActivityCoverPlugin(Star):
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Referer": "https://www.miyoushe.com/"
         }
-        
-        type_name = {1: "官方资讯", 2: "有奖活动", 3: "装扮皮肤"}.get(news_type, f"type{news_type}")
         
         try:
             async with aiohttp.ClientSession() as session:
@@ -203,7 +194,6 @@ class GenshinActivityCoverPlugin(Star):
             articles = data["data"]["list"]
             logger.debug(f"[原神资讯] type={news_type} 获取到 {len(articles)} 条资讯")
             
-            # 收集所有新文章
             pending_articles = []
             
             for article in articles:
@@ -211,7 +201,6 @@ class GenshinActivityCoverPlugin(Star):
                 post_id = post.get("post_id")
                 title = post.get("subject", "未知资讯")
                 
-                # 关键检查：是否已发送
                 if not post_id:
                     logger.debug(f"[原神资讯] 跳过无ID文章: {title[:30]}")
                     continue
@@ -223,17 +212,13 @@ class GenshinActivityCoverPlugin(Star):
                 
                 logger.info(f"[原神资讯] 发现新资讯: {post_id_str} - {title[:40]}")
                 
-                # 过滤检查
                 if self._should_filter(title):
                     self.posted_ids.add(post_id_str)
                     self._save_posted_ids()
                     continue
                 
-                # 收集图片
                 all_images: Set[str] = set()
                 cover_url = post.get("cover")
-                
-                # 判断是否只发封面
                 only_cover = self._is_activity_only_cover(title)
                 
                 if only_cover:
@@ -261,16 +246,14 @@ class GenshinActivityCoverPlugin(Star):
                         "images": image_list
                     })
             
-            # 统一判断发送方式
             if not pending_articles:
                 return
                 
             article_count = len(pending_articles)
-            forward_threshold_images = self.config.get("forward_threshold_images", 4)
-            forward_threshold_articles = self.config.get("forward_threshold_articles", 2)
+            forward_threshold_images = self._cfg("forward_threshold_images", 4)
+            forward_threshold_articles = self._cfg("forward_threshold_articles", 2)
             
             if article_count >= forward_threshold_articles:
-                # 多篇新文章 → 合并转发
                 logger.info(f"[原神资讯] 批次有 {article_count} 篇新文章，使用合并转发")
                 success = await self._send_batch_forward(pending_articles)
                 if success:
@@ -280,7 +263,6 @@ class GenshinActivityCoverPlugin(Star):
                     for art in pending_articles:
                         await self._send_images_batch(art["images"], art["title"])
             elif len(pending_articles[0]["images"]) >= forward_threshold_images:
-                # 单篇但图片 >= 4张 → 合并转发
                 art = pending_articles[0]
                 logger.info(f"[原神资讯] 单篇 {len(art['images'])} 张图，使用合并转发")
                 success = await self._send_forward_message(art["title"], art["images"])
@@ -290,12 +272,10 @@ class GenshinActivityCoverPlugin(Star):
                     logger.warning(f"[原神资讯] 单篇合并转发失败，回退到批量发送")
                     await self._send_images_batch(art["images"], art["title"])
             else:
-                # 单篇且图片 <= 3张 → 一条消息
                 art = pending_articles[0]
                 logger.info(f"[原神资讯] 单篇 {len(art['images'])} 张图，批量发送")
                 await self._send_images_batch(art["images"], art["title"])
             
-            # 发送完成后记录所有 ID
             for art in pending_articles:
                 self.posted_ids.add(art["post_id"])
             self._save_posted_ids()
@@ -307,15 +287,6 @@ class GenshinActivityCoverPlugin(Star):
             logger.error(f"[原神资讯] 检查新资讯失败(type={news_type}): {e}\n{traceback.format_exc()}")
 
     async def _send_images_batch(self, image_list: List[str], title: str) -> bool:
-        """使用一条消息发送多张图片（OneBot JSON 数组格式）
-        
-        Args:
-            image_list: 图片 URL 列表
-            title: 资讯标题（用于日志）
-            
-        Returns:
-            bool: 是否发送成功
-        """
         try:
             platform_manager = self.context.platform_manager
             if not platform_manager:
@@ -327,12 +298,11 @@ class GenshinActivityCoverPlugin(Star):
                 logger.error("[原神资讯] 没有可用的平台实例")
                 return False
             
-            target_groups = self.config.get("target_groups", [])
+            target_groups = self._target_groups()
+            sent_any = False
             
-            # 构建 OneBot JSON 数组格式的消息
-            # 第一条是标题文字，后面跟图片
             message = [
-                {"type": "text", "data": {"text": f"📢 {title}"}}
+                {"type": "text", "data": {"text": f"\U0001F4E2 {title}"}}
             ]
             for img_url in image_list:
                 message.append({
@@ -349,31 +319,22 @@ class GenshinActivityCoverPlugin(Star):
                 for group_id in target_groups:
                     try:
                         await bot.send_group_msg(
-                            group_id=int(group_id),
+                            group_id=group_id,
                             message=message
                         )
                         logger.info(f"[原神资讯] 已批量发送 {len(image_list)} 张图片到群 {group_id}: {title[:40]}")
-                        return True
+                        sent_any = True
                         
                     except Exception as e:
                         logger.error(f"[原神资讯] 批量发送到群 {group_id} 失败: {e}\n{traceback.format_exc()}")
             
-            return False
+            return sent_any
             
         except Exception as e:
             logger.error(f"[原神资讯] 批量发送图片失败: {e}\n{traceback.format_exc()}")
             return False
 
     async def _send_forward_message(self, title: str, image_list: List[str]) -> bool:
-        """使用合并转发消息发送单篇多图
-        
-        Args:
-            title: 资讯标题
-            image_list: 图片 URL 列表
-            
-        Returns:
-            bool: 是否发送成功
-        """
         try:
             platform_manager = self.context.platform_manager
             if not platform_manager:
@@ -385,9 +346,10 @@ class GenshinActivityCoverPlugin(Star):
                 logger.error("[原神资讯] 没有可用的平台实例")
                 return False
             
-            target_groups = self.config.get("target_groups", [])
+            target_groups = self._target_groups()
             sender_name = self._forward_sender_name
             sender_uin = self._forward_sender_uin or "0"
+            sent_any = False
             
             for platform in platforms:
                 if not hasattr(platform, 'bot') or not platform.bot:
@@ -397,17 +359,14 @@ class GenshinActivityCoverPlugin(Star):
                 
                 for group_id in target_groups:
                     try:
-                        # 构建转发消息节点
                         nodes = []
                         
-                        # 第一个节点：资讯标题
                         nodes.append(Node(
-                            content=[Plain(text=f"📢 {title}")],
+                            content=[Plain(text=f"\U0001F4E2 {title}")],
                             name=sender_name,
                             uin=sender_uin
                         ))
                         
-                        # 后续节点：每张图一个节点
                         for idx, img_url in enumerate(image_list, 1):
                             nodes.append(Node(
                                 content=[
@@ -418,41 +377,30 @@ class GenshinActivityCoverPlugin(Star):
                                 uin=sender_uin
                             ))
                         
-                        # 构建 payload
                         payload = {
-                            "group_id": int(group_id),
+                            "group_id": group_id,
                             "messages": []
                         }
                         
-                        # 将 Node 转换为 dict
                         for node in nodes:
                             node_dict = await node.to_dict()
                             payload["messages"].append(node_dict)
                         
-                        # 调用 OneBot API 发送合并转发消息
                         await bot.call_action("send_group_forward_msg", **payload)
                         
                         logger.info(f"[原神资讯] 已发送合并转发到群 {group_id}: {title[:40]} ({len(image_list)}张图片)")
-                        return True
+                        sent_any = True
                         
                     except Exception as e:
                         logger.error(f"[原神资讯] 发送合并转发到群 {group_id} 失败: {e}\n{traceback.format_exc()}")
             
-            return False
+            return sent_any
             
         except Exception as e:
             logger.error(f"[原神资讯] 发送合并转发失败: {e}\n{traceback.format_exc()}")
             return False
 
     async def _send_batch_forward(self, pending_articles: List[dict]) -> bool:
-        """使用合并转发消息发送多篇资讯
-        
-        Args:
-            pending_articles: 文章列表，每项包含 title, images
-            
-        Returns:
-            bool: 是否发送成功
-        """
         try:
             platform_manager = self.context.platform_manager
             if not platform_manager:
@@ -464,9 +412,10 @@ class GenshinActivityCoverPlugin(Star):
                 logger.error("[原神资讯] 没有可用的平台实例")
                 return False
             
-            target_groups = self.config.get("target_groups", [])
+            target_groups = self._target_groups()
             sender_name = self._forward_sender_name
             sender_uin = self._forward_sender_uin or "0"
+            sent_any = False
             
             for platform in platforms:
                 if not hasattr(platform, 'bot') or not platform.bot:
@@ -482,8 +431,7 @@ class GenshinActivityCoverPlugin(Star):
                             title = art["title"]
                             images = art["images"]
                             
-                            # 每篇文章一个 Node
-                            node_content = [Plain(text=f"📢 {title}")]
+                            node_content = [Plain(text=f"\U0001F4E2 {title}")]
                             for img_url in images:
                                 node_content.append(Image(file=img_url))
                             
@@ -493,9 +441,8 @@ class GenshinActivityCoverPlugin(Star):
                                 uin=sender_uin
                             ))
                         
-                        # 构建 payload
                         payload = {
-                            "group_id": int(group_id),
+                            "group_id": group_id,
                             "messages": []
                         }
                         
@@ -506,12 +453,12 @@ class GenshinActivityCoverPlugin(Star):
                         await bot.call_action("send_group_forward_msg", **payload)
                         
                         logger.info(f"[原神资讯] 已发送批次合并转发到群 {group_id} ({len(pending_articles)}篇文章)")
-                        return True
+                        sent_any = True
                         
                     except Exception as e:
                         logger.error(f"[原神资讯] 发送批次合并转发到群 {group_id} 失败: {e}\n{traceback.format_exc()}")
             
-            return False
+            return sent_any
             
         except Exception as e:
             logger.error(f"[原神资讯] 发送批次合并转发失败: {e}\n{traceback.format_exc()}")
