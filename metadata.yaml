@@ -1,5 +1,5 @@
 name: astrbot_plugin_genshin_activity_cover
-desc: 实时搬运原神官网活动封面图
-version: 1.0.0
+desc: 自动轮询米游社API，实时搬运原神官方资讯到QQ群聊
+version: 6.5.1
 author: iris
-repo: ''
+repo: https://github.com/galaxy-b612/astrbot-plugin-genshin-activity-cover
