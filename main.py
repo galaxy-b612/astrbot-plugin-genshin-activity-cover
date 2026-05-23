@@ -23,7 +23,7 @@ _API_TIMEOUT = aiohttp.ClientTimeout(total=30)
     name=PLUGIN_NAME,
     desc="实时搬运原神官网官方资讯和装扮图片",
     author="iris",
-    version="7.0.0"
+    version="7.1.0"
 )
 class GenshinActivityCoverPlugin(Star):
 
@@ -277,7 +277,24 @@ class GenshinActivityCoverPlugin(Star):
                     images.add(u)
         return images
 
-    # ── 分平台发送（每平台独立降级）─────────────────────
+    # ── 分平台发送 + 重试 ────────────────────────────────
+
+    async def _retry_send(self, action, gid: int, label: str) -> bool:
+        """执行发送动作，失败后等 3 秒重试一次（对抗 NapCat NT 内核超时）"""
+        for attempt in range(2):
+            try:
+                await action()
+                if attempt > 0:
+                    logger.info(f"[原神资讯] 群 {gid} 重试成功: {label}")
+                return True
+            except Exception as e:
+                if attempt == 0:
+                    logger.warning(f"[原神资讯] 群 {gid} 发送超时，3秒后重试: {label}")
+                    await asyncio.sleep(3)
+                else:
+                    logger.error(f"[原神资讯] 群 {gid} 发送失败（已重试）: {label}\n{e}\n{traceback.format_exc()}")
+        return False
+
 
     async def _send_per_platform(self, pending: list[dict], use_forward: bool):
         pm = self.context.platform_manager
@@ -304,16 +321,18 @@ class GenshinActivityCoverPlugin(Star):
         msg = [{"type": "text", "data": {"text": f"\U0001F4E2 {title}"}}]
         for u in image_list:
             msg.append({"type": "image", "data": {"file": u}})
-        try:
-            if hasattr(bot, "send_group_msg"):
-                await bot.send_group_msg(group_id=gid, message=msg)
-            else:
-                logger.warning(f"[原神资讯] 群 {gid} 平台不支持 send_group_msg，尝试通用消息接口")
-                # 兜底：通过平台实例的通用 send 接口发送
-                await self._send_via_platform(bot, gid, msg)
-            logger.info(f"[原神资讯] 已批量发送 {len(image_list)} 张图片到群 {gid}: {title[:40]}")
-        except Exception as e:
-            logger.error(f"[原神资讯] 批量发送到群 {gid} 失败: {e}\n{traceback.format_exc()}")
+        await self._retry_send(
+            lambda: self._do_send_batch(bot, gid, msg),
+            gid, f"批量发送 {len(image_list)} 张图片: {title[:40]}",
+        )
+
+    async def _do_send_batch(self, bot, gid: int, msg: list[dict]):
+        if hasattr(bot, "send_group_msg"):
+            await bot.send_group_msg(group_id=gid, message=msg)
+        else:
+            logger.warning(f"[原神资讯] 群 {gid} 平台不支持 send_group_msg，尝试通用消息接口")
+            await self._send_via_platform(bot, gid, msg)
+        logger.info(f"[原神资讯] 已批量发送到群 {gid}")
 
     async def _send_via_platform(self, bot, gid: int, msg: list[dict]):
         """非 OneBot 平台的兜底发送（尝试框架通用能力）"""
@@ -323,18 +342,15 @@ class GenshinActivityCoverPlugin(Star):
             logger.error(f"[原神资讯] 群 {gid} 平台无任何可用发送接口，消息丢失")
 
     async def _try_forward_to_group(self, bot, gid: int, pending: list[dict]) -> bool:
-        try:
+        async def _do():
             nodes = self._build_forward_nodes(pending)
             payload = {"group_id": gid, "messages": []}
             for nd in nodes:
                 payload["messages"].append(await nd.to_dict())
-
             await bot.call_action("send_group_forward_msg", **payload)
             logger.info(f"[原神资讯] 已发送合并转发到群 {gid} ({len(pending)}篇)")
-            return True
-        except Exception as e:
-            logger.error(f"[原神资讯] 发送合并转发到群 {gid} 失败: {e}\n{traceback.format_exc()}")
-            return False
+
+        return await self._retry_send(_do, gid, f"合并转发 {len(pending)}篇")
 
     def _build_forward_nodes(self, pending: list[dict]) -> list[Node]:
         sn = self._forward_sender_name
